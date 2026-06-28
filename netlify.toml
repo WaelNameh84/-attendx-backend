@@ -1,0 +1,18 @@
+[[redirects]]
+  from = "/api/*"
+  to = "https://attendx88.onrender.com/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+[build]
+  command = "pnpm --filter @workspace/attendance build"
+  publish = "artifacts/attendance/dist/public"
+
+[build.environment]
+  NODE_VERSION = "20"
+  BASE_PATH = "/"
