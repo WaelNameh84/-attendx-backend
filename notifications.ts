@@ -1,87 +1,133 @@
-import { Router } from "express";
-import { db, notificationsTable } from "@workspace/db";
-import { eq, desc, and, ne } from "drizzle-orm";
-import { requireAdmin } from "./auth";
+const STORAGE_KEY = "setting_daily_reminders";
 
-const router = Router();
+export function getDailyRemindersEnabled(): boolean {
+  const val = localStorage.getItem(STORAGE_KEY);
+  if (val === null) return false;
+  return val === "true";
+}
 
-router.get("/", requireAdmin, async (_req, res) => {
-  try {
-    const rows = await db
-      .select()
-      .from(notificationsTable)
-      .where(ne(notificationsTable.status, "archived"))
-      .orderBy(desc(notificationsTable.createdAt))
-      .limit(100);
-    return res.json(rows);
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
-  }
-});
+export function setDailyRemindersEnabled(enabled: boolean): void {
+  localStorage.setItem(STORAGE_KEY, String(enabled));
+}
 
-router.get("/count", requireAdmin, async (_req, res) => {
-  try {
-    const rows = await db
-      .select()
-      .from(notificationsTable)
-      .where(eq(notificationsTable.status, "unread"));
-    return res.json({ count: rows.length });
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
-  }
-});
+/* ── Permission ─────────────────────────────────────────────── */
 
-router.patch("/:id", requireAdmin, async (req, res) => {
-  try {
-    const id = parseInt(req.params.id);
-    const { status } = req.body as { status: "read" | "archived" };
-    if (!["read", "archived"].includes(status)) {
-      return res.status(400).json({ error: "Invalid status" });
+export async function requestNotificationPermission(): Promise<NotificationPermission> {
+  if (!("Notification" in window)) return "denied";
+  if (Notification.permission === "granted") return "granted";
+  if (Notification.permission === "denied") return "denied";
+  return await Notification.requestPermission();
+}
+
+export function getNotificationPermission(): NotificationPermission | "unsupported" {
+  if (!("Notification" in window)) return "unsupported";
+  return Notification.permission;
+}
+
+/* ── Show a notification ────────────────────────────────────── */
+
+async function showNotification(title: string, body: string, icon = "/icon-192.svg") {
+  if (!("Notification" in window)) return;
+  if (Notification.permission !== "granted") return;
+
+  // Prefer SW-backed notification (works in Chrome)
+  if ("serviceWorker" in navigator) {
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      await reg.showNotification(title, { body, icon, badge: icon, silent: false });
+      return;
+    } catch {
+      // fall through to legacy
     }
-    const [updated] = await db
-      .update(notificationsTable)
-      .set({ status })
-      .where(eq(notificationsTable.id, id))
-      .returning();
-    if (!updated) return res.status(404).json({ error: "Not found" });
-    return res.json(updated);
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
   }
-});
 
-router.post("/mark-all-read", requireAdmin, async (_req, res) => {
+  // Legacy fallback
   try {
-    await db
-      .update(notificationsTable)
-      .set({ status: "read" })
-      .where(eq(notificationsTable.status, "unread"));
-    return res.json({ ok: true });
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    new Notification(title, { body, icon, silent: false } as NotificationOptions);
+  } catch {
+    // browser doesn't support
   }
-});
+}
 
-router.post("/clear-all", requireAdmin, async (_req, res) => {
-  try {
-    await db
-      .update(notificationsTable)
-      .set({ status: "archived" })
-      .where(ne(notificationsTable.status, "archived"));
-    return res.json({ ok: true });
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+/* ── Scheduling ─────────────────────────────────────────────── */
+
+const activeTimers: ReturnType<typeof setTimeout>[] = [];
+
+function clearAllTimers() {
+  activeTimers.forEach(id => clearTimeout(id));
+  activeTimers.splice(0, activeTimers.length);
+}
+
+function msUntilNext(targetHour: number, targetMinute = 0): number {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(targetHour, targetMinute, 0, 0);
+  if (next <= now) {
+    next.setDate(next.getDate() + 1);
   }
-});
+  return next.getTime() - now.getTime();
+}
 
-router.delete("/:id", requireAdmin, async (req, res) => {
-  try {
-    const id = parseInt(req.params.id);
-    await db.delete(notificationsTable).where(eq(notificationsTable.id, id));
-    return res.json({ ok: true });
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
-  }
-});
+function scheduleRepeating(hour: number, minute: number, title: string, body: string) {
+  const delay = msUntilNext(hour, minute);
+  const id = setTimeout(() => {
+    showNotification(title, body);
+    scheduleRepeating(hour, minute, title, body);
+  }, delay);
+  activeTimers.push(id);
+}
 
-export default router;
+/* ── Public API ─────────────────────────────────────────────── */
+
+export function scheduleDailyReminders(lang: "en" | "ar" | "sv" = "en") {
+  clearAllTimers();
+
+  const messages: Record<string, { morning: { title: string; body: string }; evening: { title: string; body: string } }> = {
+    en: {
+      morning: { title: "Good Morning! ☀️", body: "Don't forget to check in for today's attendance." },
+      evening: { title: "End of Day 🌙",   body: "Remember to check out before you leave." },
+    },
+    ar: {
+      morning: { title: "صباح الخير! ☀️",  body: "لا تنسَ تسجيل حضورك لهذا اليوم." },
+      evening: { title: "نهاية الدوام 🌙", body: "تذكّر تسجيل انصرافك قبل المغادرة." },
+    },
+    sv: {
+      morning: { title: "God morgon! ☀️",  body: "Glöm inte att stämpla in för dagens närvaro." },
+      evening: { title: "Slut på dagen 🌙", body: "Kom ihåg att stämpla ut innan du går." },
+    },
+  };
+
+  const m = messages[lang] ?? messages.en;
+
+  scheduleRepeating(7,  0, m.morning.title, m.morning.body);
+  scheduleRepeating(16, 0, m.evening.title, m.evening.body);
+}
+
+export function cancelDailyReminders() {
+  clearAllTimers();
+}
+
+/* ── Test notification (for UI) ─────────────────────────────── */
+
+export async function sendTestNotification(lang: "en" | "ar" | "sv" = "en") {
+  const titles: Record<string, string> = {
+    en: "✅ Notifications are working!",
+    ar: "✅ الإشعارات تعمل بنجاح!",
+    sv: "✅ Notiser fungerar!",
+  };
+  const bodies: Record<string, string> = {
+    en: "You will receive daily attendance reminders.",
+    ar: "ستتلقى تذكيرات الحضور اليومية.",
+    sv: "Du kommer att få dagliga närvaro-påminnelser.",
+  };
+  await showNotification(titles[lang] ?? titles.en, bodies[lang] ?? bodies.en);
+}
+
+/* ── Boot: call this once on app start ──────────────────────── */
+
+export function bootNotifications(lang: "en" | "ar" | "sv" = "en") {
+  if (!getDailyRemindersEnabled()) return;
+  if (!("Notification" in window)) return;
+  if (Notification.permission !== "granted") return;
+  scheduleDailyReminders(lang);
+}
